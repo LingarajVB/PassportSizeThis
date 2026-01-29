@@ -1,0 +1,4 @@
+detector.*
+*.jpeg
+*.jpg
+__pycache__/
