@@ -3,3 +3,5 @@ mediapipe
 customtkinter
 numpy
 opencv-python
+rembg
+onnxruntime

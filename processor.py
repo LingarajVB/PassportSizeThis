@@ -3,9 +3,10 @@ import mediapipe as mp
 from mediapipe.tasks import python
 from mediapipe.tasks.python import vision
 import numpy as np
-from PIL import Image, ImageOps
+from PIL import Image, ImageOps, ImageEnhance, ImageFilter
 import os
 import urllib.request
+from rembg import remove, new_session
 
 class PassportGenerator:
     def __init__(self):
@@ -18,34 +19,39 @@ class PassportGenerator:
         base_options = python.BaseOptions(model_asset_path=model_path)
         options = vision.FaceDetectorOptions(base_options=base_options)
         self.detector = vision.FaceDetector.create_from_options(options)
+        
+        # Initialize rembg session for better performance
+        self.rembg_session = new_session()
 
-    def process_image(self, input_path, output_size=(350, 450)):
+    def process_image(self, input_path, output_size=(413, 531), remove_bg=True):
         """
-        Processes an image to create a passport size photo.
+        Initial processing: Background removal and cropping.
+        Standard passport size.
         """
-        # Load image with PIL
         img = Image.open(input_path)
         img = ImageOps.exif_transpose(img)
         
-        # Convert to Mediapipe Image
-        mp_image = mp.Image.create_from_file(input_path)
+        if remove_bg:
+            img = self._remove_background(img)
         
-        # Detect faces
+        temp_path = "temp_detection.png"
+        img.save(temp_path)
+        mp_image = mp.Image.create_from_file(temp_path)
         detection_result = self.detector.detect(mp_image)
+        
+        if os.path.exists(temp_path):
+            os.remove(temp_path)
 
         if not detection_result.detections:
             return self._center_crop(img, output_size)
 
-        # Get the first face
         detection = detection_result.detections[0]
         bbox = detection.bounding_box
-        
-        # Mediapipe tasks bbox is in pixels: x, y, width, height
         x, y, width, height = bbox.origin_x, bbox.origin_y, bbox.width, bbox.height
 
-        # Padding for passport look
-        padding_y = int(height * 0.6)
-        padding_x = int(width * 0.5)
+        # Refined passport padding
+        padding_y = int(height * 0.8) 
+        padding_x = int(width * 0.7)
 
         w, h = img.size
         left = max(0, x - padding_x)
@@ -56,12 +62,45 @@ class PassportGenerator:
         face_crop = img.crop((left, top, right, bottom))
         return self._resize_and_fill(face_crop, output_size)
 
+    def enhance_image(self, img, brightness=1.0, contrast=1.0, sharpness=1.0, color=1.0):
+        """
+        Applies manual enhancements.
+        """
+        # Brightness
+        enhancer = ImageEnhance.Brightness(img)
+        img = enhancer.enhance(brightness)
+        
+        # Contrast
+        enhancer = ImageEnhance.Contrast(img)
+        img = enhancer.enhance(contrast)
+        
+        # Sharpness
+        enhancer = ImageEnhance.Sharpness(img)
+        img = enhancer.enhance(sharpness)
+
+        # Color/Saturation
+        enhancer = ImageEnhance.Color(img)
+        img = enhancer.enhance(color)
+        
+        return img
+
+    def _remove_background(self, img):
+        """
+        Removes background with better edge smoothing.
+        """
+        output = remove(img, session=self.rembg_session, alpha_matting=True)
+        
+        new_bg = Image.new("RGB", output.size, (255, 255, 255))
+        if output.mode == 'RGBA':
+            new_bg.paste(output, (0, 0), mask=output.split()[3])
+        else:
+            new_bg.paste(output, (0, 0))
+            
+        return new_bg
+
     def _resize_and_fill(self, img, size):
         img.thumbnail(size, Image.Resampling.LANCZOS)
-        
-        # Create a white background
         new_img = Image.new("RGB", size, (255, 255, 255))
-        # Center the resized image
         offset = ((size[0] - img.size[0]) // 2, (size[1] - img.size[1]) // 2)
         new_img.paste(img, offset)
         return new_img
