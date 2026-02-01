@@ -10,8 +10,13 @@ from rembg import remove, new_session
 
 class PassportGenerator:
     def __init__(self):
-        # Download the model file if it doesn't exist
-        model_path = 'detector.tflite'
+        # Set models directory to project folder to avoid permission issues
+        self.models_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".models")
+        os.makedirs(self.models_dir, exist_ok=True)
+        os.environ["U2NET_HOME"] = self.models_dir
+
+        # Download the face detector model if it doesn't exist
+        model_path = os.path.join(self.models_dir, 'detector.tflite')
         if not os.path.exists(model_path):
             url = "https://storage.googleapis.com/mediapipe-models/face_detector/blaze_face_short_range/float16/1/blaze_face_short_range.tflite"
             urllib.request.urlretrieve(url, model_path)
@@ -20,8 +25,9 @@ class PassportGenerator:
         options = vision.FaceDetectorOptions(base_options=base_options)
         self.detector = vision.FaceDetector.create_from_options(options)
         
-        # Initialize rembg session for better performance
-        self.rembg_session = new_session()
+        # Initialize rembg session with state-of-the-art BiRefNet-Portrait
+        # This model is specifically trained for high-resolution human/hair segmentation
+        self.rembg_session = new_session('birefnet-portrait')
 
     def process_image(self, input_data, output_size=(413, 531), remove_bg=True):
         """
@@ -73,69 +79,69 @@ class PassportGenerator:
 
     def apply_studio_background(self, person_img, bg_color_hex):
         """
-        Applies a realistic studio background with vibrant colors and edge blending.
+        Applies a professional studio background with high-quality edge blending
+        and realistic rim lighting (color spill) from the selected background.
         """
         if person_img.mode != 'RGBA':
             return person_img
 
         w, h = person_img.size
         
-        # 1. Create vibrant background
-        # Convert hex to RGB
+        # 1. Create professional background
         bg_rgb = tuple(int(bg_color_hex.lstrip('#')[i:i+2], 16) for i in (0, 2, 4))
         
-        # Create a base background with a subtle radial gradient
-        # We use a simpler gradient to ensure colors stay vibrant and true to selection
+        # Create a base background with a subtle radial gradient (studio look)
         bg_img = Image.new("RGB", (w, h), bg_rgb)
         bg_draw = np.array(bg_img).astype(float)
         
         # Center of the gradient (roughly where the face is)
         cx, cy = w // 2, h // 3
-        
-        # Create coordinate grids
         y, x = np.ogrid[:h, :w]
         dist_from_center = np.sqrt((x - cx)**2 + (y - cy)**2)
-        
-        # Normalize distance - much subtler gradient to preserve color purity
         max_dist = np.sqrt(cx**2 + cy**2)
-        # Gradient ranges from 1.05 (slightly brighter) to 0.9 (slightly darker)
-        gradient = 1.05 - (dist_from_center / (max_dist * 2.0))
-        gradient = np.clip(gradient, 0.85, 1.05)
         
-        # Apply gradient to RGB channels
+        # Subtle studio lighting effect
+        gradient = 1.05 - (dist_from_center / (max_dist * 2.5))
+        gradient = np.clip(gradient, 0.9, 1.05)
+        
         for i in range(3):
             bg_draw[:, :, i] *= gradient
-            
-        # Ensure values stay in valid range
-        bg_draw = np.clip(bg_draw, 0, 255)
-        bg_img = Image.fromarray(bg_draw.astype(np.uint8))
+        bg_img = Image.fromarray(np.clip(bg_draw, 0, 255).astype(np.uint8))
         
-        # 2. Refine the person's edges (Feathering)
+        # 2. Advanced Edge Blending
         person_array = np.array(person_img)
-        alpha = person_array[:, :, 3]
-        
-        # Smooth the alpha mask slightly for better blending
-        alpha_pil = Image.fromarray(alpha).filter(ImageFilter.GaussianBlur(radius=0.3))
-        alpha = np.array(alpha_pil)
-        
-        # 3. Apply subtle color spill (rim lighting)
         person_rgb = person_array[:, :, :3].astype(float)
+        alpha = person_array[:, :, 3].astype(float)
         
-        # Find the edges of the alpha mask for spill
-        kernel = np.ones((3, 3), np.uint8)
-        edge_mask = cv2.morphologyEx(alpha, cv2.MORPH_GRADIENT, kernel)
-        edge_mask = (edge_mask.astype(float) / 255.0) * 0.1 # 10% intensity for subtle spill
+        # Smooth the alpha mask before generating edge effects to avoid "blocky" artifacts
+        # We use a Bilateral Filter on the alpha channel to keep it smooth but crisp
+        alpha_refined = cv2.bilateralFilter(alpha.astype(np.uint8), d=3, sigmaColor=50, sigmaSpace=50).astype(float)
+        
+        # Create a "Rim Light" mask for color spill
+        kernel_size = 3 # Smaller kernel for more precise edge detection
+        kernel = np.ones((kernel_size, kernel_size), np.uint8)
+        edge_mask = cv2.morphologyEx(alpha_refined.astype(np.uint8), cv2.MORPH_GRADIENT, kernel).astype(float) / 255.0
+        
+        # Soften the edge mask to avoid harsh lines in the color spill
+        edge_mask = cv2.GaussianBlur(edge_mask, (3, 3), 0)
+        
+        # Apply color spill: Blend background color into the edges of the person
+        # Intensity depends on background brightness to stay realistic
+        bg_luminance = (0.299 * bg_rgb[0] + 0.587 * bg_rgb[1] + 0.114 * bg_rgb[2]) / 255.0
+        spill_intensity = 0.05 + (bg_luminance * 0.1) # 5% to 15% spill
         
         for i in range(3):
-            person_rgb[:, :, i] = person_rgb[:, :, i] * (1 - edge_mask) + bg_rgb[i] * edge_mask
+            person_rgb[:, :, i] = person_rgb[:, :, i] * (1 - edge_mask * spill_intensity) + bg_rgb[i] * (edge_mask * spill_intensity)
             
-        # Combine everything back
-        refined_person = np.dstack([np.clip(person_rgb, 0, 255).astype(np.uint8), alpha])
+        # 3. Final Compositing with Soft Feathering
+        # We use a slightly blurred alpha for the final paste to avoid jagged edges
+        alpha_pil = Image.fromarray(alpha.astype(np.uint8)).filter(ImageFilter.GaussianBlur(radius=0.4))
+        
+        refined_person = np.dstack([np.clip(person_rgb, 0, 255).astype(np.uint8), alpha.astype(np.uint8)])
         refined_person_img = Image.fromarray(refined_person, 'RGBA')
         
-        # Composite person onto the background
         final_img = bg_img.copy()
-        final_img.paste(refined_person_img, (0, 0), mask=refined_person_img)
+        final_img.paste(refined_person_img, (0, 0), mask=alpha_pil)
         
         return final_img
 
@@ -394,8 +400,33 @@ class PassportGenerator:
     def _remove_background(self, img):
         """
         Removes background and returns RGBA image with transparency.
+        Uses BiRefNet for pixel-perfect hair and clothing edges.
         """
-        return remove(img, session=self.rembg_session, alpha_matting=True)
+        # BiRefNet produces high-quality soft masks natively, so we 
+        # avoid heavy internal matting which can cause the "blocky" artifacts seen.
+        processed = remove(
+            img, 
+            session=self.rembg_session, 
+            alpha_matting=False # BiRefNet is better without the old matting algorithm
+        )
+        
+        # Refine the alpha channel to remove any remaining "stair-stepping" or jaggedness
+        if processed.mode == 'RGBA':
+            r, g, b, a = processed.split()
+            
+            # Convert alpha to numpy for advanced refinement
+            a_np = np.array(a)
+            
+            # Apply a Bilateral Filter to the mask to smooth jagged edges 
+            # while preserving the sharp silhouette of the person
+            a_refined = cv2.bilateralFilter(a_np, d=5, sigmaColor=75, sigmaSpace=75)
+            
+            # Use a subtle Gaussian blur to further soften fine hair strands
+            a_refined_pil = Image.fromarray(a_refined).filter(ImageFilter.GaussianBlur(radius=0.3))
+            
+            processed = Image.merge('RGBA', (r, g, b, a_refined_pil))
+            
+        return processed
 
     def _resize_and_fill(self, img, size):
         """Resizes image to fill the target size exactly, preserving RGBA if present."""

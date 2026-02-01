@@ -3,3 +3,4 @@ detector.*
 *.jpg
 *.png
 __pycache__/
+.models
